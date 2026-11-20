@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 
 
-# 將簡稱對應回訓練模型時使用的完整欄位名稱
 BUILDING_TYPE_MAP = {
     "住宅大樓": "住宅大樓(11層含以上有電梯)",
     "華廈": "華廈(10層含以下有電梯)",
@@ -15,7 +14,6 @@ BUILDING_TYPE_MAP = {
     "店面": "店面(店鋪)",
 }
 
-# 常見行政區寫法正規化（依模型特徵清單微調）
 DISTRICT_ALIAS_MAP = {
     "臺東縣臺東市": "臺東縣台東市",
     "雲林縣臺西鄉": "雲林縣台西鄉",
@@ -35,30 +33,34 @@ class HousePricePredictor:
 
         self.model = joblib.load(model_path)
         self.model_features = list(joblib.load(feature_path))
-        self.conformal_radius, self.alpha = self._extract_conformal_params(self.model)
 
-        # 取得底層 XGBRegressor 物件供預測與 SHAP 使用
-        self.base_model = self._extract_base_model(self.model)
+        if isinstance(self.model, dict):
+            self.base_model = self.model.get("base_model")
+            self.model_low = self.model.get("model_low")
+            self.model_high = self.model.get("model_high")
+            self.q_score = (
+                float(self.model["q_score"])
+                if self.model.get("q_score") is not None
+                else 0.0
+            )
+            self.alpha = (
+                float(self.model["alpha"])
+                if self.model.get("alpha") is not None
+                else 0.1
+            )
+        else:
+            self.base_model = self.model
+            self.model_low = None
+            self.model_high = None
+            self.q_score = 0.0
+            self.alpha = 0.1
+
+        if self.base_model is None or not hasattr(self.base_model, "predict"):
+            raise ValueError("❌ 模型檔中找不到可用的 base_model")
+
         self.explainer, self.base_value = self._init_shap_explainer(self.base_model)
 
-    def _extract_base_model(self, model_obj):
-        actual_model = model_obj
-        if isinstance(model_obj, dict):
-            for key in ["base_model", "model", "regressor", "estimator"]:
-                if key in model_obj and hasattr(model_obj[key], "predict"):
-                    actual_model = model_obj[key]
-                    break
-            if actual_model is model_obj:
-                for v in model_obj.values():
-                    if hasattr(v, "predict"):
-                        actual_model = v
-                        break
-        if hasattr(actual_model, "model"):
-            actual_model = actual_model.model
-        return actual_model
-
     def _init_shap_explainer(self, model):
-        """初始化 SHAP TreeExplainer，若遇到 XGBoost base_score 格式問題則改用 Booster"""
         try:
             explainer = shap.TreeExplainer(model)
             base_val = float(np.squeeze(explainer.expected_value))
@@ -71,30 +73,6 @@ class HousePricePredictor:
                 return explainer, base_val
             except Exception:
                 return None, 0.0
-
-    def _extract_conformal_params(self, model_obj):
-        """從模型字典中取得 q_conformal 與 alpha（預設 alpha=0.1 代表 90% 信賴區間）"""
-        radius = None
-        alpha = 0.1
-        candidate_keys = [
-            "q_conformal", "q_hat_90", "q90", "q_hat", "conformal_q",
-            "quantile_90", "radius_90", "margin_90", "margin"
-        ]
-        if isinstance(model_obj, dict):
-            for k in candidate_keys:
-                if k in model_obj and isinstance(model_obj[k], (int, float, np.number)):
-                    radius = float(model_obj[k])
-                    break
-            if "alpha" in model_obj and isinstance(model_obj["alpha"], (int, float, np.number)):
-                alpha = float(model_obj["alpha"])
-        else:
-            for attr in candidate_keys:
-                if hasattr(model_obj, attr):
-                    val = getattr(model_obj, attr)
-                    if isinstance(val, (int, float, np.number)):
-                        radius = float(val)
-                        break
-        return radius, alpha
 
     def _normalize_case(self, case_dict):
         normalized = dict(case_dict)
@@ -109,7 +87,6 @@ class HousePricePredictor:
         df = pd.DataFrame([cleaned])
         df = pd.get_dummies(df)
 
-        # 一次性補齊訓練時存在但本次輸入沒有的 One-Hot 欄位
         missing_cols = {col: 0 for col in self.model_features if col not in df.columns}
         if missing_cols:
             missing_df = pd.DataFrame(missing_cols, index=df.index)
@@ -144,6 +121,19 @@ class HousePricePredictor:
     def predict(self, case_dict):
         X = self._align_features(case_dict)
         pred = float(self.base_model.predict(X)[0])
+
+        lower_bound = None
+        upper_bound = None
+        half_width = None
+
+        if self.model_low is not None and self.model_high is not None:
+            y_low = float(self.model_low.predict(X)[0])
+            y_high = float(self.model_high.predict(X)[0])
+            adj_low = y_low + self.q_score
+            adj_high = y_high - self.q_score
+            lower_bound = max(0.0, min(adj_low, adj_high))
+            upper_bound = max(0.0, max(adj_low, adj_high))
+            half_width = (upper_bound - lower_bound) / 2.0
 
         explanation_lines = []
         if self.explainer is not None:
@@ -180,23 +170,19 @@ class HousePricePredictor:
         )
 
         confidence_pct = int(round((1 - self.alpha) * 100))
-        lower_bound = None
-        upper_bound = None
-        if self.conformal_radius is not None:
-            lower_bound = max(0.0, pred - self.conformal_radius)
-            upper_bound = pred + self.conformal_radius
+        if lower_bound is not None and upper_bound is not None:
             explanation_lines.append(
-                f"📊 {confidence_pct}% 預測區間（Split Conformal）："
-                f"約 {lower_bound:.1f} ～ {upper_bound:.1f} 萬 / 坪（±{self.conformal_radius:.1f} 萬 / 坪）。"
+                f"📊 {confidence_pct}% 預測區間（CQR）："
+                f"約 {lower_bound:.1f} ～ {upper_bound:.1f} 萬 / 坪（q_score = {self.q_score:.4f}）。"
             )
         else:
-            explanation_lines.append(f"📊 {confidence_pct}% 預測區間：模型檔中未偵測到區間參數。")
+            explanation_lines.append(f"📊 {confidence_pct}% 預測區間：模型檔中未包含上下分位數模型。")
 
         return {
             "predicted_price": pred,
             "ci_90_lower": lower_bound,
             "ci_90_upper": upper_bound,
-            "ci_90_radius": self.conformal_radius,
+            "ci_90_radius": half_width,
             "confidence_pct": confidence_pct,
             "explanation": "\n".join(explanation_lines),
         }
