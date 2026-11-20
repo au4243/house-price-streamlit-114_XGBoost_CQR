@@ -5,6 +5,23 @@ import numpy as np
 import pandas as pd
 
 
+# 將簡稱對應回訓練模型時使用的完整欄位名稱
+BUILDING_TYPE_MAP = {
+    "住宅大樓": "住宅大樓(11層含以上有電梯)",
+    "華廈": "華廈(10層含以下有電梯)",
+    "公寓": "公寓(5樓含以下無電梯)",
+    "透天厝": "透天厝",
+    "套房": "套房(1房1廳1衛)",
+    "店面": "店面(店鋪)",
+}
+
+# 常見行政區寫法正規化（依模型特徵清單微調）
+DISTRICT_ALIAS_MAP = {
+    "臺東縣臺東市": "臺東縣台東市",
+    "雲林縣臺西鄉": "雲林縣台西鄉",
+}
+
+
 class HousePricePredictor:
     def __init__(self):
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -17,12 +34,12 @@ class HousePricePredictor:
             raise FileNotFoundError(f"❌ 找不到特徵檔：{feature_path}")
 
         self.model = joblib.load(model_path)
-        self.model_features = joblib.load(feature_path)
+        self.model_features = list(joblib.load(feature_path))
         self.conformal_radius, self.alpha = self._extract_conformal_params(self.model)
 
-        # 取得底層 XGBRegressor 物件供 SHAP 使用
-        actual_model = self._extract_base_model(self.model)
-        self.explainer = shap.TreeExplainer(actual_model)
+        # 取得底層 XGBRegressor 物件供預測與 SHAP 使用
+        self.base_model = self._extract_base_model(self.model)
+        self.explainer, self.base_value = self._init_shap_explainer(self.base_model)
 
     def _extract_base_model(self, model_obj):
         actual_model = model_obj
@@ -39,6 +56,21 @@ class HousePricePredictor:
         if hasattr(actual_model, "model"):
             actual_model = actual_model.model
         return actual_model
+
+    def _init_shap_explainer(self, model):
+        """初始化 SHAP TreeExplainer，若遇到 XGBoost base_score 格式問題則改用 Booster"""
+        try:
+            explainer = shap.TreeExplainer(model)
+            base_val = float(np.squeeze(explainer.expected_value))
+            return explainer, base_val
+        except Exception:
+            try:
+                booster = model.get_booster() if hasattr(model, "get_booster") else model
+                explainer = shap.TreeExplainer(booster)
+                base_val = float(np.squeeze(explainer.expected_value))
+                return explainer, base_val
+            except Exception:
+                return None, 0.0
 
     def _extract_conformal_params(self, model_obj):
         """從模型字典中取得 q_conformal 與 alpha（預設 alpha=0.1 代表 90% 信賴區間）"""
@@ -64,8 +96,17 @@ class HousePricePredictor:
                         break
         return radius, alpha
 
+    def _normalize_case(self, case_dict):
+        normalized = dict(case_dict)
+        if "district" in normalized and normalized["district"] in DISTRICT_ALIAS_MAP:
+            normalized["district"] = DISTRICT_ALIAS_MAP[normalized["district"]]
+        if "building_type" in normalized and normalized["building_type"] in BUILDING_TYPE_MAP:
+            normalized["building_type"] = BUILDING_TYPE_MAP[normalized["building_type"]]
+        return normalized
+
     def _align_features(self, case_dict):
-        df = pd.DataFrame([case_dict])
+        cleaned = self._normalize_case(case_dict)
+        df = pd.DataFrame([cleaned])
         df = pd.get_dummies(df)
 
         # 一次性補齊訓練時存在但本次輸入沒有的 One-Hot 欄位
@@ -74,7 +115,11 @@ class HousePricePredictor:
             missing_df = pd.DataFrame(missing_cols, index=df.index)
             df = pd.concat([df, missing_df], axis=1)
 
-        return df[self.model_features]
+        aligned = df[self.model_features].copy()
+        for col in aligned.columns:
+            if aligned[col].dtype == "bool":
+                aligned[col] = aligned[col].astype(int)
+        return aligned
 
     def _feature_to_human(self, feature, value):
         if feature.startswith("district_"):
@@ -98,36 +143,37 @@ class HousePricePredictor:
 
     def predict(self, case_dict):
         X = self._align_features(case_dict)
+        pred = float(self.base_model.predict(X)[0])
 
-        base_model = self._extract_base_model(self.model)
-        pred = float(base_model.predict(X)[0])
+        explanation_lines = []
+        if self.explainer is not None:
+            shap_values = self.explainer(X)
+            shap_vals = np.asarray(shap_values.values)[0]
+            feature_names = X.columns
+            base_value = self.base_value
 
-        shap_values = self.explainer(X)
-        shap_vals = shap_values.values[0]
-        feature_names = X.columns
-        base_value = float(np.squeeze(self.explainer.expected_value))
-
-        explanation_lines = [
-            f"📌 模型基準單價約為 {base_value:.1f} 萬 / 坪，以下條件使價格進行調整："
-        ]
-
-        # 依影響幅度排序取前 10 項（略過數值為 0 的未命中類別特徵）
-        idx_sorted = np.argsort(np.abs(shap_vals))[::-1]
-        shown_count = 0
-        for i in idx_sorted:
-            feat = feature_names[i]
-            val = X.iloc[0][feat]
-            shap_val = shap_vals[i]
-            if val == 0 and feat.startswith(("district_", "building_type_", "main_use_")):
-                continue
-            human_text = self._feature_to_human(feat, val)
-            direction = "推升" if shap_val > 0 else "下修"
             explanation_lines.append(
-                f"👉 {human_text}，使單價約 {direction} {abs(shap_val):.1f} 萬 / 坪"
+                f"📌 模型基準單價約為 {base_value:.1f} 萬 / 坪，以下條件使價格進行調整："
             )
-            shown_count += 1
-            if shown_count >= 10:
-                break
+
+            idx_sorted = np.argsort(np.abs(shap_vals))[::-1]
+            shown_count = 0
+            for i in idx_sorted:
+                feat = feature_names[i]
+                val = X.iloc[0][feat]
+                shap_val = float(shap_vals[i])
+                if val == 0 and feat.startswith(("district_", "building_type_", "main_use_")):
+                    continue
+                human_text = self._feature_to_human(feat, val)
+                direction = "推升" if shap_val > 0 else "下修"
+                explanation_lines.append(
+                    f"👉 {human_text}，使單價約 {direction} {abs(shap_val):.1f} 萬 / 坪"
+                )
+                shown_count += 1
+                if shown_count >= 10:
+                    break
+        else:
+            explanation_lines.append("📌 目前環境無法產生 SHAP 細項拆解，直接顯示模型預測結果：")
 
         explanation_lines.append(
             f"\n➡️ 綜合以上因素後，模型推估本案合理單價約為 {pred:.1f} 萬 / 坪。"

@@ -11,7 +11,7 @@ st.set_page_config(
 )
 
 st.title("🏠 房價估價系統（文字版）｜依據 114 年 不動產成交資料")
-st.caption("XGBoost_CQR + 可解釋 AI（SHAP）")  # 修改為 CatBoost
+st.caption("XGBoost_CQR + 可解釋 AI（SHAP）")
 
 # =========================
 # 行政區對照表
@@ -115,7 +115,7 @@ CITY_TOWN_MAP = {
         "北區", "東區", "香山區",
     ],
     "嘉義市": [
-        "西區", "東西區",
+        "嘉義市",
     ],
     "澎湖縣": [
         "七美鄉", "白沙鄉", "西嶼鄉", "馬公市", "望安鄉", "湖西鄉",
@@ -137,7 +137,11 @@ def load_predictor():
     return HousePricePredictor()
 
 
-predictor = load_predictor()
+try:
+    predictor = load_predictor()
+except Exception as e:
+    st.error(f"❌ 載入估價模型失敗：{e}")
+    st.stop()
 
 # =========================
 # 側邊欄輸入
@@ -146,7 +150,7 @@ st.sidebar.header("📋 房屋基本資料")
 
 city = st.sidebar.selectbox("縣市", list(CITY_TOWN_MAP.keys()))
 town = st.sidebar.selectbox("鄉鎮市區", CITY_TOWN_MAP[city])
-district = f"{city}{town}"
+district = city if city == "嘉義市" and town == "嘉義市" else f"{city}{town}"
 st.sidebar.caption(f"📍 行政區：{district}")
 
 building_type = st.sidebar.selectbox(
@@ -155,7 +159,6 @@ building_type = st.sidebar.selectbox(
 main_use = st.sidebar.selectbox("主要用途", ["住家用", "商業用", "住商用"])
 building_age = st.sidebar.number_input("屋齡（年）", 0, 80, 20)
 
-# 新增：建物總面積 (平方公尺)
 building_area_sqm = st.sidebar.number_input(
     "建物總面積（平方公尺）", 10.0, 500.0, 100.0
 )
@@ -175,7 +178,7 @@ case_dict = {
     "building_type": building_type,
     "main_use": main_use,
     "building_age": building_age,
-    "building_area_sqm": building_area_sqm,  # 納入傳遞給模型
+    "building_area_sqm": building_area_sqm,
     "main_area": main_area,
     "balcony_area": balcony_area,
     "floor": floor,
